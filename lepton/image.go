@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"path"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-errors/errors"
+	"github.com/nanovms/ops/mkfs"
 )
 
 var localImageDir = path.Join(GetOpsHome(), "images")
@@ -63,7 +63,7 @@ func createFile(filepath string) (*os.File, error) {
 }
 
 // add /etc/resolv.conf
-func addDNSConfig(m *Manifest, c *Config) {
+func addDNSConfig(m *mkfs.Manifest, c *Config) {
 	temp := getImageTempDir(c)
 	resolv := path.Join(temp, "resolv.conf")
 	data := []byte("nameserver ")
@@ -79,7 +79,7 @@ func addDNSConfig(m *Manifest, c *Config) {
 }
 
 // /proc/sys/kernel/hostname
-func addHostName(m *Manifest, c *Config) {
+func addHostName(m *mkfs.Manifest, c *Config) {
 	temp := getImageTempDir(c)
 	hostname := path.Join(temp, "hostname")
 	data := []byte("uniboot")
@@ -93,7 +93,7 @@ func addHostName(m *Manifest, c *Config) {
 	}
 }
 
-func addPasswd(m *Manifest, c *Config) {
+func addPasswd(m *mkfs.Manifest, c *Config) {
 	// Skip adding password file if present in package
 	if m.FileExists("/etc/passwd") {
 		return
@@ -112,7 +112,7 @@ func addPasswd(m *Manifest, c *Config) {
 }
 
 // bunch of default files that's required.
-func addDefaultFiles(m *Manifest, c *Config) error {
+func addDefaultFiles(m *mkfs.Manifest, c *Config) error {
 
 	commonPath := path.Join(GetOpsHome(), "common")
 	if _, err := os.Stat(commonPath); os.IsNotExist(err) {
@@ -149,7 +149,7 @@ func addDefaultFiles(m *Manifest, c *Config) error {
 	return nil
 }
 
-func addFilesFromPackage(packagepath string, m *Manifest) {
+func addFilesFromPackage(packagepath string, m *mkfs.Manifest) {
 
 	rootPath := filepath.Join(packagepath, "sysroot")
 	packageName := filepath.Base(packagepath)
@@ -195,14 +195,13 @@ func addFilesFromPackage(packagepath string, m *Manifest) {
 }
 
 // BuildPackageManifest builds manifest using package
-func BuildPackageManifest(packagepath string, c *Config) (*Manifest, error) {
-	m := NewManifest(c.TargetRoot)
+func BuildPackageManifest(packagepath string, c *Config) (*mkfs.Manifest, error) {
+	m := mkfs.NewManifest(c.TargetRoot)
 
 	// Add files from package
 	addFilesFromPackage(packagepath, m)
 
-	m.nightly = c.NightlyBuild
-	m.program = c.Program
+	m.AddUserProgram(c.Program)
 	err := addFromConfig(m, c)
 	if err != nil {
 		return nil, errors.Wrap(err, 1)
@@ -219,12 +218,12 @@ func BuildPackageManifest(packagepath string, c *Config) (*Manifest, error) {
 	return m, nil
 }
 
-func addFromConfig(m *Manifest, c *Config) error {
+func addFromConfig(m *mkfs.Manifest, c *Config) error {
 	m.AddKernel(c.Kernel)
 	addDNSConfig(m, c)
 	addHostName(m, c)
 	addPasswd(m, c)
-	m.AddKlibs(c.RunConfig.Klibs)
+	m.AddKlibs(c.RunConfig.Klibs, getKlibsDir(c.NightlyBuild))
 
 	for _, f := range c.Files {
 		err := m.AddFile(f, f)
@@ -267,9 +266,7 @@ func addFromConfig(m *Manifest, c *Config) error {
 	m.AddEnvironmentVariable("PWD", "/")
 	m.AddEnvironmentVariable("OPS_VERSION", Version)
 	m.AddEnvironmentVariable("NANOS_VERSION", LocalReleaseVersion)
-	for k, v := range c.Env {
-		m.AddEnvironmentVariable(k, v)
-	}
+	addEnvironmentVariables(m, c)
 
 	for k, v := range c.Mounts {
 		m.AddMount(k, v)
@@ -278,9 +275,18 @@ func addFromConfig(m *Manifest, c *Config) error {
 	return nil
 }
 
+func addEnvironmentVariables(m *mkfs.Manifest, c *Config) {
+	for k, v := range c.Env {
+		m.AddEnvironmentVariable(k, v)
+		if k == "RADAR_KEY" {
+			m.AddKlibs([]string{"tls", "radar"}, getKlibsDir(c.NightlyBuild))
+		}
+	}
+}
+
 // BuildManifest builds manifest using config
-func BuildManifest(c *Config) (*Manifest, error) {
-	m := NewManifest(c.TargetRoot)
+func BuildManifest(c *Config) (*mkfs.Manifest, error) {
+	m := mkfs.NewManifest(c.TargetRoot)
 
 	addDefaultFiles(m, c)
 
@@ -289,7 +295,6 @@ func BuildManifest(c *Config) (*Manifest, error) {
 		return nil, errors.Wrap(err, 1)
 	}
 
-	m.nightly = c.NightlyBuild
 	m.AddUserProgram(c.Program)
 
 	deps, err := getSharedLibs(c.TargetRoot, c.Program)
@@ -301,7 +306,7 @@ func BuildManifest(c *Config) (*Manifest, error) {
 	}
 
 	if c.RunConfig.IPAddr != "" {
-		m.AddNetworkConfig(&ManifestNetworkConfig{
+		m.AddNetworkConfig(&mkfs.ManifestNetworkConfig{
 			IP:      c.RunConfig.IPAddr,
 			Gateway: c.RunConfig.Gateway,
 			NetMask: c.RunConfig.NetMask,
@@ -311,7 +316,7 @@ func BuildManifest(c *Config) (*Manifest, error) {
 	return m, nil
 }
 
-func addMappedFiles(src string, dest string, m *Manifest) error {
+func addMappedFiles(src string, dest string, m *mkfs.Manifest) error {
 	dir, pattern := filepath.Split(src)
 	err := filepath.Walk(dir, func(hostpath string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -338,17 +343,7 @@ func addMappedFiles(src string, dest string, m *Manifest) error {
 	return err
 }
 
-func buildImage(c *Config, m *Manifest) error {
-	//  prepare manifest file
-	var elfmanifest string
-	elfmanifest = m.String()
-	if c.ManifestName != "" {
-		err := ioutil.WriteFile(c.ManifestName, []byte(elfmanifest), 0644)
-		if err != nil {
-			return errors.Wrap(err, 1)
-		}
-	}
-
+func buildImage(c *Config, m *mkfs.Manifest) error {
 	// produce final image, boot + kernel + elf
 	fd, err := createFile(c.RunConfig.Imagename)
 	defer func() {
@@ -360,11 +355,7 @@ func buildImage(c *Config, m *Manifest) error {
 
 	defer cleanup(c)
 
-	mkfsCommand := NewMkfsCommand(c.Mkfs)
-
-	if c.TargetRoot != "" {
-		mkfsCommand.SetTargetRoot(c.TargetRoot)
-	}
+	mkfsCommand := mkfs.NewMkfsCommand(m)
 
 	if c.BaseVolumeSz != "" {
 		mkfsCommand.SetFileSystemSize(c.BaseVolumeSz)
@@ -373,20 +364,8 @@ func buildImage(c *Config, m *Manifest) error {
 	mkfsCommand.SetBoot(c.Boot)
 	mkfsCommand.SetFileSystemPath(c.RunConfig.Imagename)
 
-	mkfsCommand.SetupCommand()
-	stdin, err := mkfsCommand.GetStdinPipe()
-	if err != nil {
-		return errors.Wrap(err, 1)
-	}
-
-	go func() {
-		defer stdin.Close()
-		io.WriteString(stdin, elfmanifest)
-	}()
-
 	err = mkfsCommand.Execute()
 	if err != nil {
-		log.Println("mkfs:" + string(mkfsCommand.GetOutput()))
 		return errors.Wrap(err, 1)
 	}
 
@@ -429,12 +408,6 @@ func DownloadNightlyImages(c *Config) error {
 		updateLocalTimestamp(remote)
 		ExtractPackage(localtar, NightlyLocalFolder)
 	}
-
-	// make mkfs executable
-	err = os.Chmod(path.Join(NightlyLocalFolder, "mkfs"), 0775)
-	if err != nil {
-		return errors.Wrap(err, 1)
-	}
 	return nil
 }
 
@@ -472,17 +445,11 @@ func DownloadReleaseImages(version string) error {
 
 	ExtractPackage(localtar, localFolder)
 
-	// make mkfs executable
-	err := os.Chmod(path.Join(localFolder, "mkfs"), 0775)
-	if err != nil {
-		return errors.Wrap(err, 1)
-	}
-
 	updateLocalRelease(version)
 	// FIXME hack to rename stage3.img to kernel.img
 	oldKernel := path.Join(localFolder, "stage3.img")
 	newKernel := path.Join(localFolder, "kernel.img")
-	_, err = os.Stat(newKernel)
+	_, err := os.Stat(newKernel)
 	if err == nil {
 		return nil
 	}
@@ -542,42 +509,3 @@ func DownloadFile(filepath string, url string, timeout int, showProgress bool) e
 	return nil
 }
 
-func lookupFile(targetRoot string, path string) (string, error) {
-	if targetRoot != "" {
-		var targetPath string
-		currentPath := path
-		for {
-			targetPath = filepath.Join(targetRoot, currentPath)
-			fi, err := os.Lstat(targetPath)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					return path, err
-				}
-				// lookup on host
-				break
-			}
-
-			if fi.Mode()&os.ModeSymlink == 0 {
-				// not a symlink found in target root
-				return targetPath, nil
-			}
-
-			currentPath, err = os.Readlink(targetPath)
-			if err != nil {
-				return path, err
-			}
-
-			if currentPath[0] != '/' {
-				// relative symlinks are ok
-				path = targetPath
-				break
-			}
-
-			// absolute symlinks need to be resolved again
-		}
-	}
-
-	_, err := os.Stat(path)
-
-	return path, err
-}

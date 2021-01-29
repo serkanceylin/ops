@@ -10,7 +10,6 @@ import (
 
 var (
 	testVolumeConfig = &Config{
-		Mkfs: path.Join(GetOpsHome(), LatestReleaseVersion, "mkfs"),
 	}
 	testVolume1 = &NanosVolume{
 		ID:    "",
